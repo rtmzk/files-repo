@@ -1,0 +1,131 @@
+pipeline {
+    agent {
+        node {
+            label 'cd'
+        }
+    }
+
+    environment {
+        PATH = '/usr/bin:/usr/local/bin:/usr/sbin:/usr/local/sbin:/bin:/sbin'
+        BUILDTAG = "${BUILD_TIMESTAMP}"
+        STANDALONE_DATAPATH = '/datavol/standalone'
+        CLUSTER_DATAPATH = '/datavol/cluster'
+        COMPOSEFILE_PATH = '/datavol/composefile'
+    }
+
+    parameters {
+        choice(
+            choices: 'mysql\nredis\nrabbitmq\nelasticsearch\nhaproxy\nnginx',
+            description: '中间件名称',
+            name: 'middleware'
+        )
+        string(
+            name: 'repoBranch',
+            defaultValue: '',
+            description: '分支名称'
+        )
+        choice(
+            choices: 'false\ntrue',
+            description: '是否是UDC镜像',
+            name: 'udc'
+        )
+    }
+
+    stages {
+        stage('get branch') {
+            steps {
+                script {
+                    try {
+                        if ("${branch}" != '') {
+                            println '---------------gilab webhook trigger---------------'
+                            branchName = branch - 'refs/heads'
+                            branchName = sh(returnStdout: true, script: "echo ${branchName} | awk -F '/' '{print \$NF}'").trim()
+                            repoName = repo
+                            println 'webhook trigger targer repository is: ' + "$repoName" + ' branch is: ' + "$branchName"
+                        }
+                    } catch (e) { }
+
+                    if ("${params.repoBranch}" != '') {
+                        println '---------------human trigger---------------'
+                        branchName = "${params.repoBranch}"
+                        repoName = "${params.middleware}"
+                        println 'human trigger targer repository is: ' + "$repoName" + ' branch is: ' + "$branchName"
+                    }
+                    }
+                }
+            }
+        stage('check out repository') {
+            steps {
+                checkout([$class: 'GitSCM', branches: [[name: "${branchName}"]], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'CleanBeforeCheckout']], submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'something-secret', url: "http://XX:YY/ops/middleware/${repoName}.git"]]])
+            }
+        }
+
+        stage('build new image') {
+            steps {
+                sh(
+                    returnStdout: true,
+                    script: """
+                        find . -type f | xargs dos2unix
+                        find . -type f -name "*.sh" | xargs chmod +x
+                        bash download_requirements.sh
+                        if [ "${repoName}" == "nginx" ];then
+                            chmod +x eptools
+                        fi
+                        docker build -t REPOSITORY_ADDRESS/PROJECT/${repoName}:${BUILDTAG} .
+                        docker push REPOSITORY_ADDRESS/PROJECT/${repoName}:${BUILDTAG}
+                    """
+                )
+            }
+        }
+        stage('push to 77 if udc set true')  {
+            when {
+                not {
+                    environment name: 'udc', value: 'false'
+                }
+            }
+            steps {
+                sh(
+                    script: """
+                        branches=${branchName}
+                        pkgVersion=\$(echo "\${branches%%-*}")
+                        docker save -o nginx-udc-\${pkgVersion}.tar REPOSITORY_ADDRESS/PROJECT/${repoName}:${BUILDTAG}
+                        scp -i /root/.ssh/id_rsa nginx-udc-\${pkgVersion}.tar root@FILE_SERVER:/edoc2-data/middleware/nginx/
+                    """
+                )
+            }
+        }
+
+        stage('prepare to deploy') {
+            steps {
+                sh """
+                    if [ "${repoName}" != "nginx" ]; then
+                        if docker stack ls | grep ${repoName} &>/dev/null ; then
+                            docker stack rm ${repoName}
+                        fi
+                        rm -fr ${STANDALONE_DATAPATH}/${repoName}/*
+                        rm -fr ${CLUSTER_DATAPATH}/${repoName}/*/*
+                        _old_img_tag=\$(cat \${COMPOSEFILE_PATH}/${repoName}.yml | grep image | awk '{print \$NF}' | uniq)
+                        sed -i "s,\$_old_img_tag,REPOSITORY_ADDRESS/PROJECT/${repoName}:${BUILDTAG},g" \${COMPOSEFILE_PATH}/${repoName}.yml
+                    fi
+                """
+            }
+        }
+
+        stage('deploy by new image') {
+            steps {
+                sh """
+                    if [ "${repoName}" != "nginx" ]; then
+                        docker stack deploy -c ${COMPOSEFILE_PATH}/${repoName}.yml ${repoName}
+                    fi
+                """
+            }
+        }
+
+        stage('clean') {
+            steps {
+                cleanWs()
+            }
+        }
+        }
+    }
+
